@@ -2,7 +2,22 @@
 // TODO: upload identity matrix if null ?
 // TODO: sampler Cube
 
+import { UniformBlock } from './UniformBlock.js';
+
 let ID = 1;
+const FLOAT_TYPES = [
+    WebGLRenderingContext.FLOAT,
+    WebGLRenderingContext.FLOAT_VEC2,
+    WebGLRenderingContext.FLOAT_VEC3,
+    WebGLRenderingContext.FLOAT_VEC4,
+    WebGLRenderingContext.FLOAT_MAT2,
+    WebGLRenderingContext.FLOAT_MAT3,
+    WebGLRenderingContext.FLOAT_MAT4,
+];
+
+const INT_TYPES = [WebGLRenderingContext.INT, WebGLRenderingContext.INT_VEC2, WebGLRenderingContext.INT_VEC3, WebGLRenderingContext.INT_VEC4];
+
+const BOOL_TYPES = [WebGLRenderingContext.BOOL, WebGLRenderingContext.BOOL_VEC2, WebGLRenderingContext.BOOL_VEC3, WebGLRenderingContext.BOOL_VEC4];
 
 // cache of typed arrays used to flatten uniform arrays
 const arrayCacheF32 = {};
@@ -78,25 +93,80 @@ export class Program {
 
         // Get active uniform locations
         this.uniformLocations = new Map();
-        let numUniforms = gl.getProgramParameter(this.program, gl.ACTIVE_UNIFORMS);
+        this.uniformBlocksInfo = new Map();
+        const isWebGL2 = this.gl.renderer.isWebgl2;
+        const numUniforms = gl.getProgramParameter(this.program, gl.ACTIVE_UNIFORMS);
+        const uniformIndices = isWebGL2 ? Array.from({ length: numUniforms }, (_, i) => i) : [];
+        const uniformBlockIndices = isWebGL2 ? gl.getActiveUniforms(this.program, uniformIndices, gl.UNIFORM_BLOCK_INDEX) : [];
+        const uniformBlockOffsets = isWebGL2 ? gl.getActiveUniforms(this.program, uniformIndices, gl.UNIFORM_OFFSET) : [];
+
         for (let uIndex = 0; uIndex < numUniforms; uIndex++) {
-            let uniform = gl.getActiveUniform(this.program, uIndex);
-            this.uniformLocations.set(uniform, gl.getUniformLocation(this.program, uniform.name));
+            const activeInfo = gl.getActiveUniform(this.program, uIndex);
+            const uniformInfo = {
+                name: activeInfo.name,
+                size: activeInfo.size,
+                type: activeInfo.type,
+            };
 
             // split uniforms' names to separate array and struct declarations
-            const split = uniform.name.match(/(\w+)/g);
-
-            uniform.uniformName = split[0];
+            const split = uniformInfo.name.match(/(\w+)/g);
+            uniformInfo.uniformName = split[0];
 
             if (split.length === 3) {
-                uniform.isStructArray = true;
-                uniform.structIndex = Number(split[1]);
-                uniform.structProperty = split[2];
+                uniformInfo.isStructArray = true;
+                uniformInfo.structIndex = Number(split[1]);
+                uniformInfo.structProperty = split[2];
             } else if (split.length === 2 && isNaN(Number(split[1]))) {
-                uniform.isStruct = true;
-                uniform.structProperty = split[1];
+                uniformInfo.isStruct = true;
+                uniformInfo.structProperty = split[1];
+            }
+
+            if (isWebGL2 && uniformBlockIndices[uIndex] > -1) {
+                const blockIndex = uniformBlockIndices[uIndex];
+                const blockOffset = uniformBlockOffsets[uIndex];
+                const blockName = gl.getActiveUniformBlockName(this.program, blockIndex);
+
+                uniformInfo.isBlock = true; // ?
+                uniformInfo.blockIndex = blockIndex;
+                uniformInfo.blockOffset = blockOffset;
+
+                if (FLOAT_TYPES.includes(uniformInfo.type)) {
+                    uniformInfo.baseType = 'FLOAT_32';
+                } else if (INT_TYPES.includes(uniformInfo.type)) {
+                    uniformInfo.baseType = 'INT_32';
+                } else if (BOOL_TYPES.includes(uniformInfo.type)) {
+                    uniformInfo.baseType = 'BOOL';
+                } else {
+                    uniformInfo.baseType = 'UNKNOWN';
+                }
+
+                const block = this.uniformBlocksInfo.get(blockName);
+                if (block) {
+                    block.uniforms.push(uniformInfo);
+                } else {
+                    const blockSize = this.gl.getActiveUniformBlockParameter(this.program, blockIndex, gl.UNIFORM_BLOCK_DATA_SIZE);
+                    this.uniformBlocksInfo.set(blockName, {
+                        name: blockName,
+                        blockIndex: blockIndex,
+                        bufferIndex: -1,
+                        size: blockSize,
+                        uniforms: [uniformInfo],
+                    });
+                }
+            } else {
+                this.uniformLocations.set(uniformInfo, gl.getUniformLocation(this.program, uniformInfo.name));
             }
         }
+
+        this.uniformBlocksInfo.forEach((info, name) => {
+            if (!this.gl.renderer.state.uniformBlocks.has(name)) {
+                const ubo = new UniformBlock(this.gl, { name, size: info.size, uniforms: info.uniforms });
+                this.gl.renderer.state.uniformBlocks.set(name, ubo);
+            }
+        });
+
+        this.uniformBlocksValues = [...this.uniformBlocksInfo.values()];
+        this.bufferBindingsIndices = new Array(this.gl.renderer.parameters.maxUniformBufferBindings);
 
         // Get active attribute locations
         this.attributeLocations = new Map();
@@ -152,6 +222,64 @@ export class Program {
             this.gl.useProgram(this.program);
             this.gl.renderer.state.currentProgram = this.id;
         }
+
+        if (this.uniformBlocksValues.length) {
+            const renderer = this.gl.renderer;
+            for (let i = 0; i < this.bufferBindingsIndices.length; i++) {
+                this.bufferBindingsIndices[i] = i;
+            }
+
+            const needsBindBufferBase = [];
+
+            for (let i = 0; i < this.uniformBlocksValues.length; i++) {
+                const info = this.uniformBlocksValues[i];
+
+                const ubo = renderer.state.uniformBlocks.get(info.name);
+                ubo.commit();
+
+                if (renderer.state.uniformBufferBindings[ubo.bufferIndex] === ubo.id) {
+                    this.bufferBindingsIndices[ubo.bufferIndex] = -1;
+
+                    if (info.bufferIndex !== ubo.bufferIndex) {
+                        info.bufferIndex = ubo.bufferIndex;
+                        console.log('uniformBlockBinding');
+                        this.gl.uniformBlockBinding(this.program, info.blockIndex, info.bufferIndex);
+                    }
+                } else {
+                    needsBindBufferBase.push({ ubo, info });
+                }
+            }
+
+            if (needsBindBufferBase.length !== 0) {
+                const freeBindingsIndices = this.bufferBindingsIndices.filter((i) => i !== -1);
+
+                let nextFree = 0;
+                for (let i = 0; i < needsBindBufferBase.length; i++) {
+                    const { ubo, info } = needsBindBufferBase[i];
+                    const bufferIndex = freeBindingsIndices[nextFree++];
+                    console.log('bind');
+                    ubo.bind(bufferIndex);
+
+                    if (info.bufferIndex !== bufferIndex) {
+                        info.bufferIndex = bufferIndex;
+                        console.log('uniformBlockBinding');
+                        this.gl.uniformBlockBinding(this.program, info.blockIndex, info.bufferIndex);
+                    }
+                }
+            }
+        }
+
+        // if (this.uniformBlocksInfo.size > 0) {
+        //     const renderer = this.gl.renderer;
+        //     let bufferIndex = 0;
+        //     this.uniformBlocksInfo.forEach((info, name) => {
+        //         const ubo = renderer.state.uniformBlocks.get(name);
+        //         ubo.commit();
+        //         ubo.bind(bufferIndex);
+        //         this.gl.uniformBlockBinding(this.program, info.blockIndex, bufferIndex);
+        //         bufferIndex++;
+        //     });
+        // }
 
         // Set only the active uniforms found in the shader
         this.uniformLocations.forEach((location, activeUniform) => {

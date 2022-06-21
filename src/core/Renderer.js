@@ -68,6 +68,8 @@ export class Renderer {
         this.state.activeTextureUnit = 0;
         this.state.boundBuffer = null;
         this.state.uniformLocations = new Map();
+        this.state.uniformBlocks = new Map();
+        this.state.uniformBufferBindings = [];
         this.state.currentProgram = null;
 
         // store requested extensions
@@ -107,6 +109,7 @@ export class Renderer {
         // Store device parameters
         this.parameters = {};
         this.parameters.maxTextureUnits = this.gl.getParameter(this.gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS);
+        this.parameters.maxUniformBufferBindings = this.isWebgl2 ? this.gl.getParameter(this.gl.MAX_UNIFORM_BUFFER_BINDINGS) : 0;
         this.parameters.maxAnisotropy = this.getExtension('EXT_texture_filter_anisotropic')
             ? this.gl.getParameter(this.getExtension('EXT_texture_filter_anisotropic').MAX_TEXTURE_MAX_ANISOTROPY_EXT)
             : 0;
@@ -344,7 +347,18 @@ export class Renderer {
         if (update) scene.updateMatrixWorld();
 
         // Update camera separately, in case not in scene graph
-        if (camera) camera.updateMatrixWorld();
+        if (camera) {
+            camera.updateMatrixWorld();
+            const cameraUBO = this.state.uniformBlocks.get('Camera');
+            if (cameraUBO) {
+                cameraUBO.setFieldValue('projectionMatrix', camera.projectionMatrix);
+                cameraUBO.setFieldValue('viewMatrix', camera.viewMatrix);
+                cameraUBO.setFieldValue('cameraPosition', camera.worldPosition);
+                cameraUBO.commit();
+            }
+        }
+
+        // console.log(JSON.stringify(this.state.uniformBufferBindings))
 
         // Get render list - entails culling and sorting
         const renderList = this.getRenderList({ scene, camera, frustumCull, sort });

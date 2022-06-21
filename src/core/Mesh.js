@@ -38,31 +38,45 @@ export class Mesh extends Transform {
     draw({ camera } = {}) {
         this.beforeRenderCallbacks.forEach((f) => f && f({ mesh: this, camera }));
         if (camera) {
-            // Add empty matrix uniforms to program if unset
-            if (!this.program.uniforms.modelMatrix) {
-                Object.assign(this.program.uniforms, {
-                    modelMatrix: { value: null },
-                    viewMatrix: { value: null },
-                    modelViewMatrix: { value: null },
-                    normalMatrix: { value: null },
-                    projectionMatrix: { value: null },
-                    cameraPosition: { value: null },
-                });
+            const hasCameraBlock = this.program.uniformBlocksInfo.has('Camera');
+            // renderer should update camera uniform block
+            if (!hasCameraBlock) {
+                // Add empty matrix uniforms to program if unset
+                this.program.uniforms.projectionMatrix ??= { value: null };
+                this.program.uniforms.viewMatrix ??= { value: null };
+                this.program.uniforms.cameraPosition ??= { value: null };
+
+                this.program.uniforms.projectionMatrix.value = camera.projectionMatrix;
+                this.program.uniforms.viewMatrix.value = camera.viewMatrix;
+                this.program.uniforms.cameraPosition.value = camera.worldPosition;
             }
 
-            // Set the matrix uniforms
-            this.program.uniforms.projectionMatrix.value = camera.projectionMatrix;
-            this.program.uniforms.cameraPosition.value = camera.worldPosition;
-            this.program.uniforms.viewMatrix.value = camera.viewMatrix;
             this.modelViewMatrix.multiply(camera.viewMatrix, this.worldMatrix);
             this.normalMatrix.getNormalMatrix(this.modelViewMatrix);
-            this.program.uniforms.modelMatrix.value = this.worldMatrix;
-            this.program.uniforms.modelViewMatrix.value = this.modelViewMatrix;
-            this.program.uniforms.normalMatrix.value = this.normalMatrix;
+
+            const hasModelBlock = this.program.uniformBlocksInfo.has('Model');
+            const modelBlock = hasModelBlock ? this.gl.renderer.state.uniformBlocks.get('Model') : null;
+
+            if (hasModelBlock && modelBlock) {
+                modelBlock.setFieldValue('modelMatrix', this.worldMatrix);
+                modelBlock.setFieldValue('modelViewMatrix', this.modelViewMatrix);
+                modelBlock.setFieldValue('normalMatrix', this.normalMatrix);
+                modelBlock.commit();
+            }
+            else {
+                // Add empty matrix uniforms to program if unset
+                this.program.uniforms.modelMatrix ??= { value: null };
+                this.program.uniforms.modelViewMatrix ??= { value: null };
+                this.program.uniforms.normalMatrix ??= { value: null };
+
+                this.program.uniforms.modelMatrix.value = this.worldMatrix;
+                this.program.uniforms.modelViewMatrix.value = this.modelViewMatrix;
+                this.program.uniforms.normalMatrix.value = this.normalMatrix;
+            }            
         }
 
         // determine if faces need to be flipped - when mesh scaled negatively
-        let flipFaces = this.program.cullFace && this.worldMatrix.determinant() < 0;
+        const flipFaces = this.program.cullFace && this.worldMatrix.determinant() < 0;
         this.program.use({ flipFaces });
         this.geometry.draw({ mode: this.mode, program: this.program });
         this.afterRenderCallbacks.forEach((f) => f && f({ mesh: this, camera }));
